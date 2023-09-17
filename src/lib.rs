@@ -7,7 +7,6 @@ use std::{
 
 use futures_core::Stream;
 
-#[derive(Clone)]
 pub struct PubSub<T: Clone> {
     channel: Arc<RwLock<Channel<T>>>,
 }
@@ -16,6 +15,7 @@ impl<T: Clone> PubSub<T> {
     pub fn new() -> Self {
         Self {
             channel: Arc::new(RwLock::new(Channel {
+                publishers: 1,
                 subscribers: HashMap::new(),
                 ids: VecDeque::new(),
                 closed: false,
@@ -44,10 +44,25 @@ impl<T: Clone> PubSub<T> {
     }
 }
 
+impl<T: Clone> Clone for PubSub<T> {
+    fn clone(&self) -> Self {
+        let mut channel = self.channel.write().unwrap();
+        channel.publishers += 1;
+        Self {
+            channel: self.channel.clone(),
+        }
+    }
+}
+
 impl<T: Clone> Drop for PubSub<T> {
     fn drop(&mut self) {
         let mut channel = self.channel.write().unwrap();
         channel.closed = true;
+        channel.publishers -= 1;
+
+        if channel.publishers > 0 {
+            return;
+        }
 
         for state in channel.subscribers.values() {
             let mut s = state.lock().unwrap();
@@ -85,6 +100,7 @@ fn subscribe<T: Clone>(channel_lock: Arc<RwLock<Channel<T>>>) -> Subscriber<T> {
 }
 
 struct Channel<T: Clone> {
+    publishers: usize,
     closed: bool,
     subscribers: HashMap<usize, Arc<Mutex<SubscriptionState<T>>>>,
     ids: VecDeque<usize>,
@@ -140,45 +156,15 @@ impl<T: Clone> Drop for Subscriber<T> {
     }
 }
 
-pub struct SubscriberMap<I, F> {
-    subscriber: I,
-    f: F,
-}
-
-impl<I, U, F> Stream for SubscriberMap<I, F>
-where
-    I: Stream + Unpin,
-    F: FnMut(I::Item) -> U + Unpin,
-{
-    type Item = U;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
-        match Stream::poll_next(Pin::new(&mut this.subscriber), cx) {
-            Poll::Ready(Some(item)) => Poll::Ready(Some((this.f)(item))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-trait StreamMapExt: Stream {
-    fn map<U, F>(self, f: F) -> SubscriberMap<Self, F>
-    where
-        Self: Sized,
-        F: FnMut(Self::Item) -> U,
-    {
-        SubscriberMap {
-            subscriber: self,
-            f,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use futures_util::StreamExt;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
+
+    use futures_core::Stream;
+    use futures_util::{task::noop_waker_ref, StreamExt};
 
     #[tokio::test]
     async fn zero_subscribers() {
@@ -263,6 +249,30 @@ mod tests {
         assert_eq!(subscriber1.next().await, None);
         assert_eq!(subscriber2.next().await, None);
         assert_eq!(subscriber3.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn multiple_publisher() {
+        let pubsub = super::PubSub::<usize>::new();
+        let mut subscriber = pubsub.subscribe();
+        let clone = pubsub.clone();
+
+        pubsub.send(1);
+        clone.send(2);
+
+        assert_eq!(subscriber.next().await, Some(1));
+        assert_eq!(subscriber.next().await, Some(2));
+
+        drop(pubsub);
+        assert_eq!(
+            Pin::new(&mut subscriber).poll_next(&mut Context::from_waker(noop_waker_ref())),
+            Poll::Pending
+        );
+        drop(clone);
+        assert_eq!(
+            Pin::new(&mut subscriber).poll_next(&mut Context::from_waker(noop_waker_ref())),
+            Poll::Ready(None),
+        );
     }
 
     #[test]
