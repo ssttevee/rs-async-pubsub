@@ -57,12 +57,13 @@ impl<T: Clone> Clone for PubSub<T> {
 impl<T: Clone> Drop for PubSub<T> {
     fn drop(&mut self) {
         let mut channel = self.channel.write().unwrap();
-        channel.closed = true;
         channel.publishers -= 1;
 
         if channel.publishers > 0 {
             return;
         }
+
+        channel.closed = true;
 
         for state in channel.subscribers.values() {
             let mut s = state.lock().unwrap();
@@ -160,7 +161,7 @@ impl<T: Clone> Drop for Subscriber<T> {
 mod tests {
     use std::{
         pin::Pin,
-        task::{Context, Poll, Waker},
+        task::{Context, Poll},
     };
 
     use futures_core::Stream;
@@ -252,7 +253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multiple_publisher() {
+    async fn multiple_publisher_multiple_subscriber() {
         let pubsub = super::PubSub::<usize>::new();
         let mut subscriber = pubsub.subscribe();
         let clone = pubsub.clone();
@@ -268,7 +269,15 @@ mod tests {
             Pin::new(&mut subscriber).poll_next(&mut Context::from_waker(noop_waker_ref())),
             Poll::Pending
         );
+        drop(subscriber);
+        let mut subscriber = clone.subscribe();
+        let clone2 = clone.clone();
         drop(clone);
+        assert_eq!(
+            Pin::new(&mut subscriber).poll_next(&mut Context::from_waker(noop_waker_ref())),
+            Poll::Pending
+        );
+        drop(clone2);
         assert_eq!(
             Pin::new(&mut subscriber).poll_next(&mut Context::from_waker(noop_waker_ref())),
             Poll::Ready(None),
